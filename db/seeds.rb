@@ -48,20 +48,39 @@ subcontractors.each do |attrs|
   end
 end
 
-Subcontractor.find_each do |subcontractor|
-  (1..5).each do |day|
-    SubcontractorAvailability.find_or_create_by!(
-      subcontractor: subcontractor,
-      day_of_week: day,
-      window_start: "09:00",
-      window_end: "12:00"
-    )
+default_availability = (1..5).flat_map do |day|
+  [
+    { day_of_week: day, window_start: "09:00", window_end: "12:00" },
+    { day_of_week: day, window_start: "13:00", window_end: "16:00" }
+  ]
+end
 
+availability_by_name = {
+  "Pine Ridge Tree Co" => [
+    { day_of_week: 1, window_start: "08:00", window_end: "11:30" },
+    { day_of_week: 3, window_start: "12:30", window_end: "16:30" },
+    { day_of_week: 5, window_start: "09:00", window_end: "14:00" }
+  ],
+  "Canopy Care Partners" => [
+    { day_of_week: 2, window_start: "10:00", window_end: "15:00" },
+    { day_of_week: 4, window_start: "08:30", window_end: "12:30" },
+    { day_of_week: 4, window_start: "13:30", window_end: "17:00" }
+  ],
+  "Root & Branch Services" => [
+    { day_of_week: 1, window_start: "07:30", window_end: "10:30" },
+    { day_of_week: 2, window_start: "12:00", window_end: "16:30" },
+    { day_of_week: 5, window_start: "09:30", window_end: "12:30" }
+  ]
+}
+
+Subcontractor.find_each do |subcontractor|
+  slots = availability_by_name.fetch(subcontractor.name, default_availability)
+  slots.each do |slot|
     SubcontractorAvailability.find_or_create_by!(
       subcontractor: subcontractor,
-      day_of_week: day,
-      window_start: "13:00",
-      window_end: "16:00"
+      day_of_week: slot[:day_of_week],
+      window_start: slot[:window_start],
+      window_end: slot[:window_end]
     )
   end
 end
