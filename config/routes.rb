@@ -25,8 +25,10 @@ Rails.application.routes.draw do
       end
 
       resources :agent_runs, only: %i[show]
-      resources :quotes, only: %i[show]
+      resources :quotes, only: %i[index show]
       resources :jobs, only: %i[index show update]
+      resources :assignments, only: %i[index show update]
+      resources :notifications, only: %i[index show]
       resources :subcontractors, only: %i[index show]
       resources :pricing_rules, only: %i[index]
     end
