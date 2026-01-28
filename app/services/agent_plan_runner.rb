@@ -44,6 +44,18 @@ class AgentPlanRunner
       return { agent_run: agent_run, plan: plan, mode: "plan_only" }
     end
 
+    if active_assignment_exists?
+      message = "Lead already has an active assignment."
+      log_action(agent_run, "assignment_locked", "error", { message: message }, message)
+      agent_run.update!(
+        status: "failed",
+        validation_errors: [message],
+        duration_ms: duration_ms_since(start_time)
+      )
+      @lead.update!(status: "failed")
+      return { agent_run: agent_run, errors: [message], mode: @mode }
+    end
+
     agent_run.update!(status: "executing")
     execution = PlanExecutor.new(lead: @lead, agent_run: agent_run, plan: plan).call
 
@@ -164,6 +176,13 @@ class AgentPlanRunner
     return "medium" if hint.include?("week")
 
     "low"
+  end
+
+  def active_assignment_exists?
+    Assignment.joins(job: :lead)
+              .where(jobs: { lead_id: @lead.id })
+              .where(status: %w[assigned confirmed])
+              .exists?
   end
 
   def select_subcontractor(service_code)

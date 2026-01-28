@@ -9,6 +9,7 @@ class PlanExecutor
     result = {}
 
     ActiveRecord::Base.transaction do
+      ensure_no_active_assignment!
       quote = create_quote
       result[:quote] = quote
       log_action("create_quote", "ok", { quote_id: quote.id })
@@ -78,6 +79,16 @@ class PlanExecutor
       subcontractor_id: @plan[:subcontractor_id],
       status: "assigned"
     )
+  end
+
+  def ensure_no_active_assignment!
+    active = Assignment.joins(job: :lead)
+                        .where(jobs: { lead_id: @lead.id })
+                        .where(status: %w[assigned confirmed])
+                        .exists?
+    return unless active
+
+    raise StandardError, "Lead already has an active assignment."
   end
 
   def create_notification(job)
