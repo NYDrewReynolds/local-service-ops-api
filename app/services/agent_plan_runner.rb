@@ -1,5 +1,6 @@
 class AgentPlanRunner
   MAX_SCHEMA_ATTEMPTS = 2
+  FALLBACK_MODEL_NAME = "heuristic"
 
   def initialize(lead:, mode:)
     @lead = lead
@@ -11,13 +12,15 @@ class AgentPlanRunner
     agent_run = AgentRun.create!(
       lead: @lead,
       status: "started",
-      model: "stubbed",
+      model: AgentPlanGeneration::OpenAiPlanGenerator.model_name,
       input_context: build_input_context
     )
+    @agent_run = agent_run
 
     agent_run.update!(status: "validating")
 
     plan, validation_errors = generate_valid_plan
+    agent_run.update!(model: @model_used || agent_run.model)
     if validation_errors.any?
       agent_run.update!(
         status: "failed",
@@ -73,20 +76,100 @@ class AgentPlanRunner
   private
 
   def generate_valid_plan
-    attempts = 0
-    validation_errors = []
+    input_context = build_input_context
+    input_payload = build_openai_payload(input_context)
+    schema_reference = plan_schema_reference
 
-    while attempts < MAX_SCHEMA_ATTEMPTS
-      attempts += 1
-      plan = generate_plan
-      validation_errors = JSON::Validator.fully_validate(plan_schema, plan)
-      return [plan, []] if validation_errors.empty?
+    attempt = openai_plan_result(input_payload: input_payload, schema_reference: schema_reference)
+    if attempt[:error]
+      log_action(
+        @agent_run,
+        "openai_generate_plan",
+        "error",
+        { error: attempt[:error], duration_ms: attempt[:duration_ms], model: attempt[:model] },
+        attempt[:error]
+      )
+      return fallback_plan_with_validation
     end
 
+    log_action(
+      @agent_run,
+      "openai_generate_plan",
+      "ok",
+      { duration_ms: attempt[:duration_ms], model: attempt[:model] }
+    )
+
+    plan = normalize_plan(attempt[:plan])
+    validation_errors = validate_plan(plan)
+    return [plan, []] if validation_errors.empty?
+
+    repair = repair_plan(
+      invalid_json: attempt[:raw_json],
+      validation_errors: validation_errors,
+      input_payload: input_payload,
+      schema_reference: schema_reference
+    )
+
+    if repair[:error]
+      log_action(
+        @agent_run,
+        "openai_repair_plan",
+        "error",
+        { error: repair[:error], duration_ms: repair[:duration_ms], model: repair[:model] },
+        repair[:error]
+      )
+      return fallback_plan_with_validation
+    end
+
+    log_action(
+      @agent_run,
+      "openai_repair_plan",
+      "ok",
+      { duration_ms: repair[:duration_ms], model: repair[:model] }
+    )
+
+    plan = normalize_plan(repair[:plan])
+    validation_errors = validate_plan(plan)
+    return [plan, []] if validation_errors.empty?
+
+    fallback_plan_with_validation
+  end
+
+  def generate_plan(input_payload:, schema_reference:)
+    result = openai_plan_result(input_payload: input_payload, schema_reference: schema_reference)
+    return {} if result[:error]
+
+    normalize_plan(result[:plan])
+  end
+
+  def openai_plan_result(input_payload:, schema_reference:)
+    result = AgentPlanGeneration::OpenAiPlanGenerator.call(
+      input_payload: input_payload,
+      schema_reference: schema_reference
+    )
+    @model_used = result[:model] if result[:model]
+    result
+  end
+
+  def repair_plan(invalid_json:, validation_errors:, input_payload:, schema_reference:)
+    result = AgentPlanGeneration::OpenAiJsonRepair.call(
+      invalid_json: invalid_json,
+      validation_errors: validation_errors,
+      input_payload: input_payload,
+      schema_reference: schema_reference
+    )
+    @model_used = result[:model] if result[:model]
+    result
+  end
+
+  def fallback_plan_with_validation
+    @model_used = FALLBACK_MODEL_NAME
+    plan = deterministic_plan
+    validation_errors = validate_plan(plan)
     [plan, validation_errors]
   end
 
-  def generate_plan
+  def deterministic_plan
     service_code = infer_service_code
     pricing_rule = PricingRule.find_by(service_code: service_code)
     subcontractor = select_subcontractor(service_code)
@@ -110,9 +193,18 @@ class AgentPlanRunner
       schedule: schedule,
       subcontractor_id: subcontractor&.id,
       customer_message: customer_message(schedule),
-      confidence: 0.72,
+      confidence: confidence_score(service_code, subcontractor),
       assumptions: ["Single service visit", "No access restrictions noted"]
     }
+  end
+
+  def normalize_plan(plan)
+    return {} unless plan.is_a?(Hash)
+    plan.deep_symbolize_keys
+  end
+
+  def validate_plan(plan)
+    JSON::Validator.fully_validate(plan_schema, plan.deep_stringify_keys)
   end
 
   def apply_guardrails(plan)
@@ -138,8 +230,9 @@ class AgentPlanRunner
       subcontractor = select_subcontractor(plan[:service_code])
       adjustments << "Reassigned subcontractor for service coverage."
       plan[:subcontractor_id] = subcontractor&.id
-      plan[:schedule] = build_schedule(subcontractor)
     end
+
+    adjustments.concat(enforce_schedule(plan, subcontractor))
 
     if subcontractor.nil?
       adjustments << "No eligible subcontractor available."
@@ -159,6 +252,46 @@ class AgentPlanRunner
           subcontractor_availabilities: sub.subcontractor_availabilities.map(&:attributes)
         )
       end
+    }
+  end
+
+  def build_openai_payload(input_context)
+    {
+      lead: input_context[:lead].slice(
+        "full_name",
+        "email",
+        "phone",
+        "address_line1",
+        "city",
+        "state",
+        "postal_code",
+        "service_requested",
+        "notes",
+        "urgency_hint"
+      ),
+      allowed_services: input_context[:services].map { |svc| svc.slice("code", "name") },
+      pricing_rules: input_context[:pricing_rules].map do |rule|
+        rule.slice("service_code", "min_price_cents", "max_price_cents", "base_price_cents")
+      end,
+      subcontractors: input_context[:subcontractors].map do |sub|
+        {
+          id: sub["id"],
+          name: sub["name"],
+          service_codes: sub["service_codes"],
+          is_active: sub["is_active"],
+          availabilities: Array(sub["subcontractor_availabilities"] || sub[:subcontractor_availabilities]).map do |slot|
+            slot.slice("day_of_week", "window_start", "window_end")
+          end
+        }
+      end,
+      business_constraints: {
+        schedule_min: "next_business_day_or_later",
+        schedule_window: "must_match_availability_if_possible_else_default_09_00-12_00",
+        quote_bounds: "total_cents must be within pricing_rules min/max for service",
+        subcontractor_eligibility: "subcontractor must include service_code or be null",
+        timezone: "America/New_York"
+      },
+      plan_schema: plan_schema_reference
     }
   end
 
@@ -197,13 +330,11 @@ class AgentPlanRunner
     window_end = "12:00"
 
     if subcontractor
-      availability = subcontractor.subcontractor_availabilities.find do |slot|
-        slot.day_of_week == date.wday
-      end
+      availability = availability_for_date(subcontractor, date)
 
       if availability
-        window_start = availability.window_start.strftime("%H:%M")
-        window_end = availability.window_end.strftime("%H:%M")
+        window_start = format_availability_time(availability.window_start)
+        window_end = format_availability_time(availability.window_end)
       end
     end
 
@@ -214,8 +345,123 @@ class AgentPlanRunner
     }
   end
 
+  def enforce_schedule(plan, subcontractor)
+    adjustments = []
+    schedule = plan[:schedule].is_a?(Hash) ? plan[:schedule] : {}
+
+    next_business = next_business_day
+    date = parse_schedule_date(schedule[:date]) || next_business
+    if date < next_business
+      date = next_business
+      adjustments << "Adjusted schedule date to next business day."
+    end
+
+    window_start = schedule[:window_start].presence || "09:00"
+    window_end = schedule[:window_end].presence || "12:00"
+
+    if subcontractor
+      slots = availabilities_for_date(subcontractor, date)
+      if slots.any?
+        matching_slot = matching_availability_slot(slots, window_start, window_end)
+        slot = matching_slot || slots.first
+        window_start = format_availability_time(slot.window_start)
+        window_end = format_availability_time(slot.window_end)
+        adjustments << "Adjusted schedule to match subcontractor availability." if schedule[:date] != date.iso8601 ||
+                                                                          schedule[:window_start] != window_start ||
+                                                                          schedule[:window_end] != window_end
+      else
+        next_slot = next_available_slot(subcontractor, date)
+        if next_slot
+          date = next_slot[:date]
+          window_start = format_availability_time(next_slot[:slot].window_start)
+          window_end = format_availability_time(next_slot[:slot].window_end)
+          adjustments << "Adjusted schedule to next available subcontractor window."
+        end
+      end
+    end
+
+    plan[:schedule] = {
+      date: date.iso8601,
+      window_start: window_start,
+      window_end: window_end
+    }
+
+    adjustments
+  end
+
+  def availability_for_date(subcontractor, date)
+    availabilities_for_date(subcontractor, date).first
+  end
+
+  def availabilities_for_date(subcontractor, date)
+    subcontractor.subcontractor_availabilities
+                 .select { |slot| slot.day_of_week == date.wday }
+                 .sort_by(&:window_start)
+  end
+
+  def matching_availability_slot(slots, window_start, window_end)
+    return if window_start.blank? || window_end.blank?
+
+    slots.find do |slot|
+      slot_start = format_availability_time(slot.window_start)
+      slot_end = format_availability_time(slot.window_end)
+      schedule_within_slot?(window_start, window_end, slot_start, slot_end)
+    end
+  end
+
+  def schedule_within_slot?(schedule_start, schedule_end, slot_start, slot_end)
+    schedule_start_minutes = minutes_since_midnight(schedule_start)
+    schedule_end_minutes = minutes_since_midnight(schedule_end)
+    slot_start_minutes = minutes_since_midnight(slot_start)
+    slot_end_minutes = minutes_since_midnight(slot_end)
+
+    return false unless [schedule_start_minutes, schedule_end_minutes, slot_start_minutes, slot_end_minutes].all?
+
+    schedule_start_minutes >= slot_start_minutes && schedule_end_minutes <= slot_end_minutes
+  end
+
+  def minutes_since_midnight(value)
+    return if value.blank?
+    parts = value.split(":").map(&:to_i)
+    return if parts.length < 2
+
+    (parts[0] * 60) + parts[1]
+  end
+
+  def format_availability_time(value)
+    return "09:00" if value.nil?
+    time = value.in_time_zone("America/New_York")
+    time.strftime("%H:%M")
+  end
+
+  def next_available_slot(subcontractor, start_date)
+    (0..14).each do |offset|
+      date = start_date + offset
+      slot = availability_for_date(subcontractor, date)
+      return { date: date, slot: slot } if slot
+    end
+    nil
+  end
+
+  def parse_schedule_date(value)
+    return if value.blank?
+    Time.zone.parse(value.to_s)&.to_date
+  rescue ArgumentError, TypeError
+    nil
+  end
+
+  def confidence_score(service_code, subcontractor)
+    score = 0.5
+    score += 0.1 if service_code.present?
+    score += 0.1 if subcontractor.present?
+    score += 0.1 if @lead.urgency_hint.to_s.strip.empty?
+    score += 0.1 if @lead.service_requested.to_s.strip.length >= 8
+    score = score.clamp(0.3, 0.9)
+    score.round(2)
+  end
+
   def next_business_day
-    date = Date.current
+    date = Time.zone.today
     date += 1 while date.saturday? || date.sunday?
     date
   end
@@ -270,6 +516,34 @@ class AgentPlanRunner
         "confidence" => { "type" => "number" },
         "assumptions" => { "type" => "array", "items" => { "type" => "string" } }
       }
+    }
+  end
+
+  def plan_schema_reference
+    {
+      required_keys: %w[
+        service_code
+        urgency_level
+        quote
+        schedule
+        subcontractor_id
+        customer_message
+        confidence
+        assumptions
+      ],
+      quote: {
+        line_items: {
+          required_keys: %w[description quantity unit_price_cents total_cents]
+        },
+        total_cents: "integer"
+      },
+      schedule: {
+        date: "YYYY-MM-DD",
+        window_start: "HH:MM",
+        window_end: "HH:MM"
+      },
+      subcontractor_id: "string or null",
+      additional_properties: false
     }
   end
 
